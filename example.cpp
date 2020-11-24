@@ -1,6 +1,6 @@
 #include <iostream>
 #include <string>
-#include "long_jmper.hpp"
+#include "corof.hpp"
 
 corof::long_jmper suspend_one_integer()
 {
