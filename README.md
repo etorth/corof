@@ -2,7 +2,7 @@
 
 longjmp()-style c++20 coroutine support
 
-compile
+compile:
 ```shell
 g++-10 example.cpp -std=c++20 -fcoroutines
 ```
