@@ -1,3 +1,3 @@
 # long_jmper
 
-longjmp()-like c++20 coroutine support
+longjmp()-style c++20 coroutine support
