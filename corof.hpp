@@ -1,61 +1,153 @@
-/*
- * =====================================================================================
- *
- *       Filename: long_jmper.hpp
- *        Created: 03/07/2020 12:36:32
- *    Description: originally from:
- *                 https://stackoverflow.com/questions/61696746/supsending-thrugh-multiple-nested-coroutines
- *
- *        Version: 1.0
- *       Revision: none
- *       Compiler: g++ -std=c++20
- *
- *         Author: ANHONG
- *          Email:
- *   Organization:
- *
- * =====================================================================================
- */
-
 #pragma once
-#include <any>
 #include <optional>
 #include <coroutine>
-#include <stdexcept>
+#include <exception>
+#include <cassert>
+#include "raiitimer.hpp"
+#define fflassert(...) assert(__VA_ARGS__)
 
 namespace corof
 {
-    class long_jmper_promise;
-    class [[nodiscard]] long_jmper 
+    namespace _details
+    {
+        struct base_promise
+        {
+            base_promise *inner_promise = nullptr;
+            base_promise *outer_promise = nullptr;
+
+            virtual ~base_promise() = default;
+            virtual std::coroutine_handle<> get_handle() = 0;
+        };
+
+        struct eval_poller_base_promise: public base_promise
+        {
+            std::exception_ptr exceptr = nullptr;
+            auto initial_suspend() noexcept
+            {
+                return std::suspend_always{};
+            }
+
+            auto final_suspend() noexcept
+            {
+                return std::suspend_always{};
+            }
+
+            void unhandled_exception()
+            {
+                exceptr = std::current_exception();
+            }
+
+            void rethrow_if_unhandled_exception()
+            {
+                if(exceptr){
+                    std::rethrow_exception(exceptr);
+                }
+            }
+        };
+
+        struct eval_poller_promise_with_void: public _details::eval_poller_base_promise
+        {
+            void return_void(){}
+        };
+
+        template<typename T> struct eval_poller_promise_with_type: public _details::eval_poller_base_promise
+        {
+            T value;
+            void return_value(T t)
+            {
+                value = std::move(t);
+            }
+        };
+    }
+
+    template<typename T = void> class [[nodiscard]] eval_poller
     {
         public:
-            using promise_type = long_jmper_promise;
-            using  handle_type = std::coroutine_handle<promise_type>;
+            struct promise_type: public std::conditional_t<std::is_void_v<T>, _details::eval_poller_promise_with_void, _details::eval_poller_promise_with_type<T>>
+            {
+                std::coroutine_handle<> get_handle() override
+                {
+                    return std::coroutine_handle<promise_type>::from_promise(*this);
+                }
+
+                eval_poller get_return_object()
+                {
+                    return eval_poller{std::coroutine_handle<promise_type>::from_promise(*this)};
+                }
+            };
+
+        private:
+            class [[nodiscard]] awaiter
+            {
+                private:
+                    friend class eval_poller;
+
+                private:
+                    std::coroutine_handle<eval_poller::promise_type> m_handle;
+
+                private:
+                    explicit awaiter(std::coroutine_handle<eval_poller::promise_type> handle)
+                        : m_handle(handle)
+                    {}
+
+                public:
+                    awaiter              (      awaiter &&) = delete;
+                    awaiter              (const awaiter  &) = delete;
+                    awaiter & operator = (      awaiter &&) = delete;
+                    awaiter & operator = (const awaiter  &) = delete;
+
+                public:
+                    bool await_ready() noexcept
+                    {
+                        return false;
+                    }
+
+                public:
+                    template<typename OuterPrimise> void await_suspend(std::coroutine_handle<OuterPrimise> h) noexcept
+                    {
+                        /**/   h.promise().inner_promise = std::addressof(m_handle.promise());
+                        m_handle.promise().outer_promise = std::addressof(       h.promise());
+                    }
+
+                public:
+                    auto await_resume()
+                    {
+                        if constexpr(std::is_void_v<T>){
+                            return;
+                        }
+                        else{
+                            return m_handle.promise().value;
+                        }
+                    }
+            };
+
+        private:
+            std::coroutine_handle<eval_poller::promise_type> m_handle;
 
         public:
-            handle_type m_handle;
-
-        public:
-            long_jmper(handle_type handle = nullptr)
-                : m_handle(handle) 
+            explicit eval_poller(std::coroutine_handle<eval_poller::promise_type> handle)
+                : m_handle(handle)
             {}
 
-            long_jmper(long_jmper&& other) noexcept
-                : m_handle(other.m_handle)
+        public:
+            eval_poller(eval_poller && other) noexcept
             {
-                other.m_handle = nullptr;
+                std::swap(m_handle, other.m_handle);
             }
 
         public:
-            long_jmper & operator = (long_jmper && other) noexcept
+            eval_poller & operator = (eval_poller && other) noexcept
             {
-                m_handle = other.m_handle;
-                other.m_handle = nullptr;
+                std::swap(m_handle, other.m_handle);
                 return *this;
             }
 
         public:
-            ~long_jmper()
+            eval_poller              (const eval_poller &) = delete;
+            eval_poller & operator = (const eval_poller &) = delete;
+
+        public:
+            ~eval_poller()
             {
                 if(m_handle){
                     m_handle.destroy();
@@ -69,170 +161,110 @@ namespace corof
             }
 
         public:
-            inline bool poll_one();
-
-        private:
-            static inline handle_type find_handle(handle_type);
-
-        public:
-            template<typename T> class [[nodiscard]] eval_op
+            bool poll()
             {
-                private:
-                    handle_type m_eval_handle;
+                fflassert(m_handle);
+                auto curr_promise = find_promise(std::addressof(m_handle.promise()));
 
-                public:
-                    eval_op(long_jmper &&jmper) noexcept
-                        : m_eval_handle(jmper.m_handle)
-                    {
-                        jmper.m_handle = nullptr;
+                if(curr_promise->get_handle().done()){
+                    if(!curr_promise->outer_promise){
+                        return true;
                     }
 
-                    ~eval_op()
-                    {
-                        if(m_eval_handle){
-                            m_eval_handle.destroy();
-                        }
-                    }
+                    // jump out for one layer
+                    // should I call destroy() for done handle?
 
-                public:
-                    eval_op & operator = (eval_op && other) noexcept
-                    {
-                        m_eval_handle = other.m_eval_handle;
-                        other.m_eval_handle = nullptr;
-                        return *this;
-                    }
+                    auto outer_promise = curr_promise->outer_promise;
 
-                public:
-                    bool await_ready() noexcept
-                    {
-                        return false;
-                    }
-
-                public:
-                    bool await_suspend(handle_type handle) noexcept;
-                    decltype(auto) await_resume();
-            };
-
-        public:
-            template<typename T> [[nodiscard]] eval_op<T> eval()
-            {
-                if(valid()){
-                    return eval_op<T>(std::move(*this));
+                    curr_promise = outer_promise;
+                    curr_promise->inner_promise = nullptr;
                 }
-                throw std::runtime_error("long_jmper has no eval-context associated");
+
+                // resume only once and return immediately
+                // after resume curr_handle can be in done state, next call to poll should unlink it
+
+                curr_promise->get_handle().resume();
+                return m_handle.done();
             }
 
-            template<typename T> auto sync_eval()
+        private:
+            static inline _details::base_promise *find_promise(_details::base_promise *promise)
             {
-                while(!poll_one()){
+                auto curr_promise = promise;
+                auto next_promise = promise->inner_promise;
+
+                while(curr_promise && next_promise){
+                    curr_promise = next_promise;
+                    next_promise = next_promise->inner_promise;
+                }
+                return curr_promise;
+            }
+
+        public:
+            decltype(auto) sync_eval()
+            {
+                while(!poll()){
                     continue;
                 }
-                return eval<T>().await_resume();
+                return awaiter(m_handle).await_resume();
             }
-    };
-
-    class long_jmper_promise 
-    {
-        private:
-            friend class long_jmper;
-
-        private:
-            std::any m_value;
-            long_jmper::handle_type m_inner_handle;
-            long_jmper::handle_type m_outer_handle;
 
         public:
-            template<typename T> T &get_value()
+            awaiter operator co_await()
             {
-                return std::any_cast<T &>(m_value);
+                return awaiter(m_handle);
+            }
+    };
+}
+
+namespace corof
+{
+    template<typename T> class async_variable
+    {
+        private:
+            std::optional<T> m_var;
+
+        public:
+            template<typename U = T> void assign(U && u)
+            {
+                fflassert(!m_var.has_value());
+                m_var = std::make_optional<T>(std::move(u));
             }
 
-            auto initial_suspend()
-            {
-                return std::suspend_never{};
-            }
+        public:
+            async_variable() = default;
 
-            auto final_suspend()
-            {
-                return std::suspend_always{};
-            }
+        public:
+            template<typename U    > async_variable                 (const async_variable<U> &) = delete;
+            template<typename U = T> async_variable<T> & operator = (const async_variable<U> &) = delete;
 
-            template<typename T> auto return_value(T t)
+        public:
+            auto operator co_await() noexcept
             {
-                m_value = std::move(t);
-                return std::suspend_always{};
-            }
-
-            long_jmper get_return_object()
-            {
-                return {std::coroutine_handle<long_jmper_promise>::from_promise(*this)};
-            }
-
-            void unhandled_exception()
-            {
-                std::terminate();
-            }
-
-            void rethrow_if_unhandled_exception()
-            {
+                return [](corof::async_variable<T> *p) -> corof::eval_poller<T>
+                {
+                    while(!p->m_var.has_value()){
+                        co_await std::suspend_always{};
+                    }
+                    co_return p->m_var.value();
+                }(this);
             }
     };
 
-    inline long_jmper::handle_type long_jmper::find_handle(long_jmper::handle_type start_handle)
+    inline corof::eval_poller<size_t> async_wait(uint64_t msec)
     {
-        if(!start_handle){
-            throw std::runtime_error("invalid argument: find_handle(nullptr)");
+        size_t count = 0;
+        if(msec == 0){
+            co_await std::suspend_always{};
+            count++;
         }
-
-        auto curr_handle = start_handle;
-        auto next_handle = start_handle.promise().m_inner_handle;
-
-        while(curr_handle && next_handle){
-            curr_handle = next_handle;
-            next_handle = next_handle.promise().m_inner_handle;
-        }
-        return curr_handle;
-    }
-
-    inline bool long_jmper::poll_one()
-    {
-        if(!m_handle){
-            throw std::runtime_error("long_jmper has no eval-context associated");
-        }
-
-        handle_type curr_handle = find_handle(m_handle);
-        if(curr_handle.done()){
-            if(!curr_handle.promise().m_outer_handle){
-                return true;
-            }
-
-            // jump out for one layer
-            // should I call destroy() for done handle?
-
-            curr_handle = curr_handle.promise().m_outer_handle;
-            curr_handle.promise().m_inner_handle = nullptr;
-
-            if(curr_handle.done()){
-                throw std::runtime_error("linked done handle detected");
+        else{
+            hres_timer timer;
+            while(timer.diff_msec() < msec){
+                co_await std::suspend_always{};
+                count++;
             }
         }
-
-        // resume only once and return immediately
-        // after resume curr_handle can be in done state, next call to poll_one should unlink it
-
-        curr_handle.resume();
-        return m_handle.done();
-    }
-
-    template<typename T> inline bool long_jmper::eval_op<T>::await_suspend(handle_type handle) noexcept
-    {
-        handle       .promise().m_inner_handle = m_eval_handle;
-        m_eval_handle.promise().m_outer_handle = handle;
-        return true;
-    }
-
-    template<typename T> inline decltype(auto) long_jmper::eval_op<T>::await_resume()
-    {
-        return m_eval_handle.promise().get_value<T>();
+        co_return count;
     }
 }
